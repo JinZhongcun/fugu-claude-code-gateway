@@ -3,6 +3,16 @@
 Run **Claude Code** on the **Sakana Fugu** model, billed to your own Sakana key.
 Cross-platform (macOS/Linux), dependency-free Node proxy. No OpenRouter, no third party.
 
+## It works
+
+Claude Code running on Fugu Ultra — same UI, tools, and agent loop, with Fugu as the backend:
+
+![Claude Code status line showing fugu with xhigh effort](assets/screenshot-fugu.png)
+
+`fugu-ultra` shows up as a custom model in Claude Code's `/model` picker:
+
+![Claude Code /model picker with fugu-ultra selected](assets/screenshot-model-picker.png)
+
 ## Why this exists
 
 Claude Code only speaks the **Anthropic Messages API** (`POST /v1/messages`).

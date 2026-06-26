@@ -153,4 +153,7 @@ const server=http.createServer(async (req,res)=>{
     res.end(JSON.stringify({type:'error',error:{type:'api_error',message:String(e)}}));
   }
 });
-server.listen(PORT,()=>{ log('listening :'+PORT+' -> '+UPSTREAM+' default='+DEFAULT_MODEL+' effort='+(EFFORT||'(off)')); console.log('[fugu-proxy] :'+PORT+' -> Sakana ('+DEFAULT_MODEL+')'); });
+// loopback only — never bind 0.0.0.0 (the proxy ignores the inbound token, so an
+// exposed port = an open relay on your Sakana key). Override with FUGU_BIND if needed.
+const BIND = process.env.FUGU_BIND || '127.0.0.1';
+server.listen(PORT,BIND,()=>{ log('listening '+BIND+':'+PORT+' -> '+UPSTREAM+' default='+DEFAULT_MODEL+' effort='+(EFFORT||'(off)')); console.log('[fugu-proxy] '+BIND+':'+PORT+' -> Sakana ('+DEFAULT_MODEL+')'); });
