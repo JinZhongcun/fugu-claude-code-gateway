@@ -1,0 +1,11 @@
+# runtime artifacts — may contain request/response data, never commit
+proxy.log
+proxy.out
+*.log
+*.out
+# secrets
+.env
+.env.local
+*.key
+# node
+node_modules/

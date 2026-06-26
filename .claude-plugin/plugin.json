@@ -1,0 +1,8 @@
+{
+  "name": "fugu-claude-code-gateway",
+  "description": "Run Claude Code on the Sakana Fugu model via a bundled, dependency-free Anthropic<->OpenAI translation proxy. Cross-platform (macOS/Linux), uses your own Sakana API key.",
+  "version": "0.1.0",
+  "author": { "name": "jinzhongcun" },
+  "license": "MIT",
+  "keywords": ["claude-code", "claude-code-plugin", "claude-code-skills", "sakana", "fugu", "proxy"]
+}

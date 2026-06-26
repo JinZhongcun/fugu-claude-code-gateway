@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# claude-fugu — run Claude Code backed by Sakana Fugu via a local translation proxy.
+#
+# Claude Code only speaks the Anthropic Messages API (POST /v1/messages); Sakana
+# exposes OpenAI-compatible faces only (/v1/chat/completions). This launcher
+# starts the bundled fugu-proxy.js (Anthropic <-> OpenAI translation) and points
+# Claude Code at it. Billing goes to your Sakana key — no OpenRouter, no third party.
+#
+# Usage:
+#   export SAKANA_API_KEY=...           # your Sakana key
+#   ./claude-fugu                       # interactive Claude Code on Fugu
+#   ./claude-fugu -p "hello"            # one-shot
+#   FUGU_MODEL=fugu-ultra ./claude-fugu # use Fugu Ultra
+set -euo pipefail
+
+# Resolve real script dir even when invoked through a symlink (e.g. ~/.local/bin).
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+PORT="${FUGU_PORT:-4000}"
+MODEL="${FUGU_MODEL:-fugu}"
+: "${SAKANA_API_KEY:?Set SAKANA_API_KEY first (export SAKANA_API_KEY=...)}"
+
+if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+  echo "[claude-fugu] starting proxy on :$PORT (model=$MODEL)" >&2
+  PORT="$PORT" FUGU_MODEL="$MODEL" SAKANA_API_KEY="$SAKANA_API_KEY" \
+    setsid node "$DIR/fugu-proxy.js" >"$DIR/proxy.out" 2>&1 &
+  # Wait until the proxy actually answers (curl handles the retry/backoff — no `sleep`).
+  if ! curl -s -o /dev/null --retry 40 --retry-delay 1 --retry-connrefused --max-time 3 \
+        -X POST "http://127.0.0.1:$PORT/v1/messages/count_tokens" \
+        -H 'content-type: application/json' -d '{}'; then
+    echo "[claude-fugu] proxy failed to start; see $DIR/proxy.out" >&2
+    cat "$DIR/proxy.out" >&2 || true
+    exit 1
+  fi
+  echo "[claude-fugu] proxy ready on :$PORT" >&2
+fi
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+export ANTHROPIC_AUTH_TOKEN="proxy-local"   # ignored by the proxy; just satisfies the client
+unset ANTHROPIC_API_KEY
+exec claude --model "$MODEL" "$@"
