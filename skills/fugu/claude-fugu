@@ -19,16 +19,31 @@ DIR="$(cd "$(dirname "$SELF")" && pwd)"
 
 PORT="${FUGU_PORT:-4000}"
 MODEL="${FUGU_MODEL:-fugu}"
+NAME="fugu-claude-code-gateway"
 : "${SAKANA_API_KEY:?Set SAKANA_API_KEY first (export SAKANA_API_KEY=...)}"
 
-if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+# Is OUR gateway already listening on this port? Don't trust an open port blindly —
+# verify it identifies as this gateway via /health (else a foreign service on :PORT
+# could silently receive Claude Code's traffic).
+gateway_health() { curl -s --max-time 3 "http://127.0.0.1:$1/health" 2>/dev/null; }
+
+if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+  health="$(gateway_health "$PORT")"
+  if printf '%s' "$health" | grep -q "\"name\":\"$NAME\""; then
+    echo "[claude-fugu] reusing gateway already on :$PORT" >&2
+  else
+    echo "[claude-fugu] ERROR: something is already listening on 127.0.0.1:$PORT but it is NOT $NAME." >&2
+    echo "[claude-fugu] Refusing to route Claude Code to an unknown service. Use FUGU_PORT=<free port> or stop that process." >&2
+    echo "[claude-fugu] (run: $DIR/fugu-doctor)" >&2
+    exit 1
+  fi
+else
   echo "[claude-fugu] starting proxy on :$PORT (model=$MODEL)" >&2
   PORT="$PORT" FUGU_MODEL="$MODEL" SAKANA_API_KEY="$SAKANA_API_KEY" \
     setsid node "$DIR/fugu-proxy.js" >"$DIR/proxy.out" 2>&1 &
   # Wait until the proxy actually answers (curl handles the retry/backoff — no `sleep`).
   if ! curl -s -o /dev/null --retry 40 --retry-delay 1 --retry-connrefused --max-time 3 \
-        -X POST "http://127.0.0.1:$PORT/v1/messages/count_tokens" \
-        -H 'content-type: application/json' -d '{}'; then
+        "http://127.0.0.1:$PORT/health"; then
     echo "[claude-fugu] proxy failed to start; see $DIR/proxy.out" >&2
     cat "$DIR/proxy.out" >&2 || true
     exit 1

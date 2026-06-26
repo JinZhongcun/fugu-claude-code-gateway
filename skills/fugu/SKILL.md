@@ -20,66 +20,51 @@ A skill runs *inside* an already-started session, so it **cannot** retarget the
 session you are in. What this skill does is **set up the gateway and start a
 NEW Claude Code process** that talks to Fugu. Tell the user this plainly.
 
-## Prerequisites
+## What to do
 
-- `node` (v18+), `curl`, and `nc` available on PATH.
-- `claude` (Claude Code CLI) installed.
-- `SAKANA_API_KEY` exported in the environment. If it is missing, ask the user
-  to run `export SAKANA_API_KEY=<their key>` — never hardcode or echo the key.
+Don't hand-roll the proxy startup. Drive everything through two bundled commands
+(run them from this skill's directory; they resolve their own paths):
 
-## Steps
-
-1. **Check the key is set** (do not print its value):
+1. **Confirm the key is set — never print its value.** If missing, ask the user to
+   `export SAKANA_API_KEY=<their key>`.
    ```bash
-   [ -n "$SAKANA_API_KEY" ] && echo "key: set" || echo "key: MISSING — ask user to export SAKANA_API_KEY"
+   [ -n "$SAKANA_API_KEY" ] && echo "key: set" || echo "key: MISSING"
    ```
 
-2. **Start the proxy** (idempotent; skip if `:4000` already listening). Run from
-   this skill's directory so the relative path resolves:
+2. **Tell the user to launch with `claude-fugu`** (it starts the gateway if needed,
+   verifies the port really belongs to this gateway via `/health`, then launches
+   Claude Code):
    ```bash
-   nc -z 127.0.0.1 4000 2>/dev/null || \
-     setsid node ./fugu-proxy.js >./proxy.out 2>&1 &
-   curl -s -o /dev/null --retry 40 --retry-delay 1 --retry-connrefused --max-time 3 \
-     -X POST http://127.0.0.1:4000/v1/messages/count_tokens \
-     -H 'content-type: application/json' -d '{}' && echo "proxy ready"
-   ```
-
-3. **Health-check through the proxy** (optional; proves the whole path works):
-   ```bash
-   curl -s --max-time 60 -X POST http://127.0.0.1:4000/v1/messages \
-     -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
-     -d '{"model":"fugu","max_tokens":32,"messages":[{"role":"user","content":"reply with exactly: READY"}]}'
-   ```
-
-4. **Tell the user how to launch Claude Code on Fugu.** Either the bundled
-   launcher (recommended), or manual env:
-   ```bash
-   # Recommended: the bundled launcher (auto-starts the proxy too)
-   ./claude-fugu                       # interactive
+   ./claude-fugu                       # interactive Claude Code on Fugu
    FUGU_MODEL=fugu-ultra ./claude-fugu # Fugu Ultra
-
-   # Manual equivalent:
-   export ANTHROPIC_BASE_URL="http://127.0.0.1:4000"
-   export ANTHROPIC_AUTH_TOKEN="proxy-local"   # ignored by the proxy
-   unset ANTHROPIC_API_KEY
-   claude --model fugu
    ```
+   Symlink it onto PATH for convenience: `ln -sf "$PWD/claude-fugu" ~/.local/bin/claude-fugu`.
 
-   For convenience, the launcher can be symlinked onto PATH:
+3. **If anything fails, run the doctor** (it never prints the key) and report the
+   failing check:
    ```bash
-   ln -sf "$PWD/claude-fugu" ~/.local/bin/claude-fugu
+   ./fugu-doctor
    ```
 
-## Models
+Manual equivalent, if the user can't use the launcher:
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:4000"
+export ANTHROPIC_AUTH_TOKEN="proxy-local"   # ignored by the proxy
+unset ANTHROPIC_API_KEY
+claude --model fugu
+```
 
-- `FUGU_MODEL=fugu` (default) or `fugu-ultra`. The proxy also routes by the
-  `--model` you pass to Claude Code (anything containing "ultra" → `fugu-ultra`).
+## Rules
 
-## Notes & caveats
+- **Never print or log `SAKANA_API_KEY`.**
+- **Don't trust an open port** — `claude-fugu` checks `/health` identifies as this
+  gateway before routing Claude Code to it. Don't bypass that with a bare `nc -z`.
+- **No silent model changes.** The gateway never falls back `fugu-ultra → fugu` on
+  its own; failures are visible (`FUGU_ON_FAILURE=fail|advise`).
+- The proxy binds `127.0.0.1` only — do not expose the port.
+- `FUGU_MODEL=fugu` (default) or `fugu-ultra`; routing also honors `--model`
+  (anything containing "ultra" → `fugu-ultra`).
+- It's an **unofficial** bridge; a Sakana/Anthropic API change can break it.
 
-- This is an **unofficial** bridge; a Sakana/Anthropic API change can break it.
-- The proxy listens on **localhost only** — do not expose the port.
-- Upstream is **Chat Completions** (the robust target for tool use + streaming).
-- Fugu Ultra can be slow (internal orchestration); long turns are expected.
-- The proxy reads `SAKANA_API_KEY` from the environment at runtime and stores no
-  secret in any file. Never commit `proxy.out` / `proxy.log`.
+See `references/compatibility.md` for the full feature matrix, failure policy,
+timeouts, and config env vars.

@@ -1,6 +1,7 @@
 # runtime artifacts — may contain request/response data, never commit
 proxy.log
 proxy.out
+proxy.pid
 *.log
 *.out
 # secrets

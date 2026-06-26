@@ -4,25 +4,47 @@
 // Sakana exposes OpenAI-compatible faces only (/v1/chat/completions, /v1/responses);
 // it has NO /v1/messages (returns 404). This proxy bridges the gap: it accepts
 // Anthropic Messages requests from Claude Code, translates to Sakana's Chat
-// Completions, and translates the reply (and SSE stream / tool calls) back.
+// Completions, and translates the reply (and synthetic SSE stream / tool calls) back.
 //
 // Auth: uses $SAKANA_API_KEY to call Sakana. The token Claude Code sends to THIS
 // proxy is ignored. No OpenRouter involved — billed to your Sakana subscription.
 //
+// Failure policy: this gateway NEVER changes models silently. If the upstream
+// fails or times out, the request fails visibly (FUGU_ON_FAILURE=fail|advise).
+//
 // Run:  SAKANA_API_KEY=... PORT=4000 node fugu-proxy.js
-// Deps: none (Node 18+, global fetch).
+// Deps: none (Node 18+, global fetch + AbortController).
 const http = require('http');
 const fs   = require('fs');
+const path = require('path');
+
+const VERSION = '0.2.0';
+const NAME    = 'fugu-claude-code-gateway';
 
 const SAKANA_KEY    = process.env.SAKANA_API_KEY;
 const UPSTREAM      = process.env.FUGU_UPSTREAM || 'https://api.sakana.ai/v1/chat/completions';
 const DEFAULT_MODEL = process.env.FUGU_MODEL || 'fugu';     // used when request model is not a fugu variant
-const EFFORT        = process.env.FUGU_EFFORT || '';         // optional: high|xhigh (passed as reasoning_effort; unverified on chat/completions)
+const EFFORT        = process.env.FUGU_EFFORT || '';         // optional: high|xhigh|max (verified accepted by Sakana chat/completions)
 const PORT          = parseInt(process.env.PORT || '4000', 10);
-const LOG           = process.env.PROXY_LOG || (__dirname + '/proxy.log');
+const BIND          = process.env.FUGU_BIND || '127.0.0.1'; // loopback only by default — do NOT expose to the network
+const LOG           = process.env.PROXY_LOG || path.join(__dirname, 'proxy.log');
+const PIDFILE       = path.join(__dirname, 'proxy.pid');
 
-function log(s){ try{ fs.appendFileSync(LOG, '['+new Date().toISOString()+'] '+s+'\n'); }catch(e){} }
+// timeouts (ms): Fugu Ultra orchestrates a deeper pool and is slower, so it gets more headroom.
+const TIMEOUT_MS       = parseInt(process.env.FUGU_TIMEOUT_MS || '300000', 10);        // 5 min
+const ULTRA_TIMEOUT_MS = parseInt(process.env.FUGU_ULTRA_TIMEOUT_MS || '900000', 10);  // 15 min
+// failure policy: 'fail' (default, visible error) | 'advise' (visible error + retry hint). NEVER silent fallback.
+const ON_FAILURE = (process.env.FUGU_ON_FAILURE || 'fail').toLowerCase();
+
+let reqSeq = 0;
+function nowISO(){ try { return new Date().toISOString(); } catch(e){ return ''; } }
+// structured JSON-lines log. NEVER logs message content / prompts / tool_result bodies.
+function log(obj){
+  try { fs.appendFileSync(LOG, JSON.stringify(Object.assign({ ts: nowISO() }, obj)) + '\n'); } catch(e){}
+}
 function readBody(req){ return new Promise((res,rej)=>{ let d=''; req.on('data',c=>d+=c); req.on('end',()=>res(d)); req.on('error',rej); }); }
+// parse without leaking request content into errors/logs on malformed input
+function safeParse(s){ try{ return JSON.parse(s||'{}'); }catch(e){ return undefined; } }
 
 // Route by the model name Claude Code sends (e.g. --model fugu-ultra), else default.
 function pickModel(reqModel){
@@ -30,7 +52,9 @@ function pickModel(reqModel){
   if(reqModel && /fugu/i.test(reqModel))  return 'fugu';
   return DEFAULT_MODEL;
 }
+function timeoutFor(model){ return /ultra/i.test(model) ? ULTRA_TIMEOUT_MS : TIMEOUT_MS; }
 
+// ---- translation (Anthropic <-> OpenAI Chat Completions) — unchanged, verified working ----
 function anthToOpenAI(body){
   const msgs=[];
   if(body.system){
@@ -119,41 +143,101 @@ function streamAnth(res,a){
   res.end();
 }
 
+// ---- upstream call with timeout; returns a classified result ----
+// kind: 'ok' | 'timeout' | 'network' | 'client' | 'server' | 'rate_limit'
+async function callUpstream(oaReq, timeoutMs){
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=>ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(UPSTREAM, { method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+SAKANA_KEY}, body:JSON.stringify(oaReq), signal:ctrl.signal });
+    const text = await r.text();
+    if(r.ok){ let j; try{ j=JSON.parse(text); }catch(e){ j={}; } return { kind:'ok', status:r.status, json:j }; }
+    let kind='client';
+    if(r.status===429) kind='rate_limit';
+    else if(r.status>=500) kind='server';
+    return { kind, status:r.status, detail:'upstream '+r.status+': '+text.slice(0,200) };
+  } catch(e){
+    const isTimeout = (e && e.name==='AbortError');
+    return { kind: isTimeout?'timeout':'network', detail: isTimeout ? ('timeout after '+timeoutMs+'ms') : ('network: '+(e&&e.message||e)) };
+  } finally { clearTimeout(timer); }
+}
+
+function failMessage(model, r){
+  let msg = (r.kind==='timeout' ? ('upstream timeout for '+model) : (r.kind+' from upstream for '+model)) + '; no fallback was performed';
+  if(ON_FAILURE==='advise'){
+    msg += '. You can retry; or run `FUGU_MODEL=fugu claude-fugu` to use the lighter model. '
+         + 'This gateway never switches models silently.';
+  }
+  return msg;
+}
+function sendErr(res, status, message){
+  res.writeHead(status,{'Content-Type':'application/json'});
+  res.end(JSON.stringify({type:'error',error:{type:'api_error',message}}));
+}
+
 const server=http.createServer(async (req,res)=>{
   try{
+    // --- identity / liveness (no upstream call, no billing) ---
+    if(req.method==='GET' && (req.url==='/health' || req.url.startsWith('/health?'))){
+      res.writeHead(200,{'Content-Type':'application/json'});
+      res.end(JSON.stringify({ ok:true, name:NAME, version:VERSION, bind:BIND, port:PORT, upstream:UPSTREAM, default_model:DEFAULT_MODEL, effort:EFFORT||null, has_sakana_key:!!SAKANA_KEY, on_failure:ON_FAILURE }));
+      return;
+    }
+    if(req.method==='GET' && req.url.startsWith('/version')){
+      res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify({ name:NAME, version:VERSION })); return;
+    }
+    // --- explicit upstream ping (DOES call Sakana = small billing). Used by fugu-doctor. ---
+    if(req.method==='POST' && req.url.startsWith('/health/upstream')){
+      let model = DEFAULT_MODEL;
+      try{ const b=JSON.parse((await readBody(req))||'{}'); if(b.model) model=pickModel(b.model); }catch(e){}
+      const t0=Date.now();
+      const r=await callUpstream({model, max_tokens:16, messages:[{role:'user',content:'ping'}]}, 30000);  // Sakana min max_tokens = 16
+      res.writeHead(r.kind==='ok'?200:502,{'Content-Type':'application/json'});
+      res.end(JSON.stringify({ ok:r.kind==='ok', name:NAME, model, latency_ms:Date.now()-t0, kind:r.kind, status:r.status||null, detail:r.detail||null }));
+      return;
+    }
     if(req.method==='POST' && req.url.startsWith('/v1/messages/count_tokens')){
-      const body=JSON.parse((await readBody(req))||'{}');
+      const body=safeParse(await readBody(req)); if(body===undefined){ sendErr(res,400,'invalid JSON body'); return; }
       const txt=JSON.stringify(body.messages||'')+JSON.stringify(body.system||'');
       res.writeHead(200,{'Content-Type':'application/json'});
       res.end(JSON.stringify({input_tokens:Math.ceil(txt.length/4)})); return;
     }
     if(req.method==='POST' && req.url.startsWith('/v1/messages')){
-      const body=JSON.parse((await readBody(req))||'{}');
+      if(!SAKANA_KEY){ sendErr(res,500,'SAKANA_API_KEY is not set in the proxy environment'); return; }
+      const id='req_'+(++reqSeq);
+      const body=safeParse(await readBody(req)); if(body===undefined){ sendErr(res,400,'invalid JSON body'); return; }
       const wantStream=!!body.stream;
+      const model=pickModel(body.model);
       const oaReq=anthToOpenAI(body);
-      log('IN model='+body.model+'->'+oaReq.model+' stream='+wantStream+' msgs='+(body.messages||[]).length+' tools='+((body.tools||[]).length));
-      const r=await fetch(UPSTREAM,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SAKANA_KEY},body:JSON.stringify(oaReq)});
-      const text=await r.text();
-      if(!r.ok){
-        log('UPSTREAM '+r.status+' '+text.slice(0,300));
-        res.writeHead(r.status,{'Content-Type':'application/json'});
-        res.end(JSON.stringify({type:'error',error:{type:'api_error',message:'upstream '+r.status+': '+text.slice(0,500)}})); return;
+      log({ id, event:'in', model_in:body.model||null, model_out:model, stream:wantStream, msgs:(body.messages||[]).length, tools:(body.tools||[]).length });
+      const r=await callUpstream(oaReq, timeoutFor(model));
+      if(r.kind!=='ok'){
+        const status=r.status || (r.kind==='timeout'?504:502);
+        log({ id, event:'upstream_error', model_out:model, kind:r.kind, status });   // detail not echoed to client
+        sendErr(res, status, failMessage(model, r));
+        return;
       }
-      let oaResp; try{ oaResp=JSON.parse(text); }catch(e){ oaResp={}; }
-      const anth=openAIToAnth(oaResp, body.model);
-      log('OUT ok blocks='+anth.content.length+' usage='+JSON.stringify(anth.usage));
+      const anth=openAIToAnth(r.json, model);
+      log({ id, event:'out', model_out:model, blocks:anth.content.length, usage:anth.usage });
       if(wantStream) streamAnth(res,anth);
       else { res.writeHead(200,{'Content-Type':'application/json'}); res.end(JSON.stringify(anth)); }
       return;
     }
     res.writeHead(404,{'Content-Type':'application/json'}); res.end(JSON.stringify({error:'not found',path:req.url}));
   }catch(e){
-    log('ERR '+(e&&e.stack||e));
-    res.writeHead(500,{'Content-Type':'application/json'});
-    res.end(JSON.stringify({type:'error',error:{type:'api_error',message:String(e)}}));
+    log({ event:'exception', error:(e&&e.name||'Error') });   // name only — never echo request/upstream content
+    try{ sendErr(res,500,'proxy error'); }catch(_){}            // res may already be sent (streaming) — ignore
   }
 });
-// loopback only — never bind 0.0.0.0 (the proxy ignores the inbound token, so an
-// exposed port = an open relay on your Sakana key). Override with FUGU_BIND if needed.
-const BIND = process.env.FUGU_BIND || '127.0.0.1';
-server.listen(PORT,BIND,()=>{ log('listening '+BIND+':'+PORT+' -> '+UPSTREAM+' default='+DEFAULT_MODEL+' effort='+(EFFORT||'(off)')); console.log('[fugu-proxy] '+BIND+':'+PORT+' -> Sakana ('+DEFAULT_MODEL+')'); });
+
+// a throw after headers are sent (rare streaming path) must not crash a long-running proxy
+process.on('uncaughtException', (e)=>{ log({ event:'uncaughtException', error:(e&&e.name||'Error') }); });
+server.on('error', (e)=>{ log({ event:'server_error', error:(e&&e.message||String(e)) }); });
+
+server.listen(PORT,BIND,()=>{
+  try{ fs.writeFileSync(PIDFILE,String(process.pid)); }catch(e){}
+  log({ event:'listening', bind:BIND, port:PORT, upstream:UPSTREAM, default_model:DEFAULT_MODEL, effort:EFFORT||null, on_failure:ON_FAILURE, version:VERSION });
+  console.log('[fugu-proxy] v'+VERSION+' '+BIND+':'+PORT+' -> Sakana ('+DEFAULT_MODEL+') on_failure='+ON_FAILURE);
+});
+function shutdown(){ try{ fs.unlinkSync(PIDFILE); }catch(e){} try{ server.close(); }catch(e){} process.exit(0); }
+process.on('SIGTERM',shutdown); process.on('SIGINT',shutdown);

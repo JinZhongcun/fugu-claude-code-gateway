@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# fugu-doctor — one-command diagnosis for the Fugu gateway.
+# Checks prerequisites, the local gateway identity, and (optionally) Sakana upstream.
+# NEVER prints your SAKANA_API_KEY.
+#
+# Usage:
+#   ./fugu-doctor                 # local checks + upstream ping for `fugu`
+#   FUGU_DOCTOR_ULTRA=1 ./fugu-doctor   # also ping fugu-ultra (slower, small billing)
+set -uo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+PORT="${FUGU_PORT:-4000}"
+NAME="fugu-claude-code-gateway"
+ok=0; warn=0; bad=0
+pass(){ echo "[fugu-doctor] OK   $*"; ok=$((ok+1)); }
+note(){ echo "[fugu-doctor] WARN $*"; warn=$((warn+1)); }
+fail(){ echo "[fugu-doctor] FAIL $*"; bad=$((bad+1)); }
+
+# --- prerequisites ---
+if command -v node >/dev/null 2>&1; then pass "node: $(node --version)"; else fail "node not found (need v18+)"; fi
+command -v curl >/dev/null 2>&1 && pass "curl: present" || fail "curl not found"
+command -v nc   >/dev/null 2>&1 && pass "nc: present"   || note "nc not found (launcher uses it for the port check)"
+command -v claude >/dev/null 2>&1 && pass "claude: $(claude --version 2>/dev/null || echo present)" || fail "claude (Claude Code CLI) not found"
+
+# --- key presence (never printed) ---
+if [ -n "${SAKANA_API_KEY:-}" ]; then pass "SAKANA_API_KEY: set (${#SAKANA_API_KEY} chars, not shown)"; else fail "SAKANA_API_KEY not set — export it first"; fi
+
+# --- local gateway identity ---
+health="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+if [ -z "$health" ]; then
+  note "local gateway: nothing answering on 127.0.0.1:$PORT (it auto-starts when you run claude-fugu)"
+elif printf '%s' "$health" | grep -q "\"name\":\"$NAME\""; then
+  ver="$(printf '%s' "$health" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+  bind="$(printf '%s' "$health" | sed -n 's/.*"bind":"\([^"]*\)".*/\1/p')"
+  pass "local gateway: $NAME v${ver:-?} on ${bind:-?}:$PORT"
+  printf '%s' "$health" | grep -q '"bind":"127.0.0.1"' || note "gateway bind is not 127.0.0.1 — check FUGU_BIND (avoid exposing the port)"
+  printf '%s' "$health" | grep -q '"has_sakana_key":true' || note "gateway reports has_sakana_key=false — the proxy process has no SAKANA_API_KEY"
+else
+  fail "127.0.0.1:$PORT is occupied by something that is NOT $NAME — pick a free FUGU_PORT or stop that process"
+fi
+
+# --- upstream reachability (small billing) ---
+ping_model(){ # $1=model
+  local r; r="$(curl -s --max-time 35 -X POST "http://127.0.0.1:$PORT/health/upstream" \
+       -H 'content-type: application/json' -d "{\"model\":\"$1\"}" 2>/dev/null || true)"
+  if printf '%s' "$r" | grep -q '"ok":true'; then
+    local ms; ms="$(printf '%s' "$r" | sed -n 's/.*"latency_ms":\([0-9]*\).*/\1/p')"
+    pass "upstream $1: reachable (${ms:-?} ms)"
+  else
+    local k; k="$(printf '%s' "$r" | sed -n 's/.*"kind":"\([^"]*\)".*/\1/p')"
+    fail "upstream $1: not reachable (${k:-no response}) — check SAKANA_API_KEY / network / api.sakana.ai"
+  fi
+}
+if [ -n "$health" ] && printf '%s' "$health" | grep -q "\"name\":\"$NAME\""; then
+  ping_model "fugu"
+  if [ "${FUGU_DOCTOR_ULTRA:-0}" = "1" ]; then ping_model "fugu-ultra"; else echo "[fugu-doctor] SKIP upstream fugu-ultra (set FUGU_DOCTOR_ULTRA=1 to test; it is slower)"; fi
+else
+  note "skipping upstream ping (no local gateway to ask)"
+fi
+
+# --- recent errors in the proxy log ---
+if [ -f "$DIR/proxy.log" ]; then
+  errs="$(grep -c '"event":"upstream_error"\|"event":"exception"' "$DIR/proxy.log" 2>/dev/null)"; errs="${errs:-0}"
+  if [ "$errs" -gt 0 ] 2>/dev/null; then note "proxy.log has $errs error events (tail: $DIR/proxy.log)"; else pass "proxy.log: no error events"; fi
+fi
+
+echo "[fugu-doctor] summary: $ok ok, $warn warn, $bad fail"
+[ "$bad" -eq 0 ]
