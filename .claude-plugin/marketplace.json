@@ -1,0 +1,12 @@
+{
+  "name": "fugu-gateway",
+  "description": "Marketplace for the fugu-claude-code-gateway plugin: run Claude Code on Sakana Fugu.",
+  "owner": { "name": "jinzhongcun" },
+  "plugins": [
+    {
+      "name": "fugu-claude-code-gateway",
+      "source": "./",
+      "description": "Run Claude Code on the Sakana Fugu model via a bundled Anthropic<->OpenAI translation proxy. Cross-platform (macOS/Linux), uses your own Sakana API key."
+    }
+  ]
+}

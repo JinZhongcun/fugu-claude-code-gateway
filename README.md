@@ -25,17 +25,22 @@ translates the reply (streaming SSE + tool calls) back.
 
 ## Install
 
-### As a plugin
+### As a plugin (recommended)
 
-```bash
-/plugin marketplace add jinzhongcun/fugu-claude-code-gateway
-/plugin install fugu-claude-code-gateway@jinzhongcun/fugu-claude-code-gateway
+Inside Claude Code:
+
 ```
+/plugin marketplace add JinZhongcun/fugu-claude-code-gateway
+/plugin install fugu-claude-code-gateway@fugu-gateway
+```
+
+(`fugu-gateway` is the marketplace name from `.claude-plugin/marketplace.json`;
+`fugu-claude-code-gateway` is the plugin name.)
 
 ### Manual (clone + symlink the skill)
 
 ```bash
-git clone https://github.com/jinzhongcun/fugu-claude-code-gateway
+git clone https://github.com/JinZhongcun/fugu-claude-code-gateway
 ln -s "$(pwd)/fugu-claude-code-gateway/skills/fugu" ~/.claude/skills/fugu
 ```
 
